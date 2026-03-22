@@ -1,3 +1,4 @@
+import streamlit as st
 from setuptools.command.install import install
 
 import matplotlib.pyplot as plt
