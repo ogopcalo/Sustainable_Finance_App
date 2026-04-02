@@ -1,31 +1,25 @@
 import streamlit as st
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-st.set_page_config(page_title="ESG Portfolio Optimiser", layout="wide")
+st.set_page_config(page_title="ESG Company Recommender", layout="wide")
 
-# =========================================================
-# Defaults
-# =========================================================
+# --------------------------------------------------
+# Session state
+# --------------------------------------------------
 DEFAULTS = {
     "page": "intro",
-    "mu1_pct": 5.00,
-    "mu2_pct": 12.00,
-    "sigma1_pct": 9.00,
-    "sigma2_pct": 20.00,
-    "rf_pct": 2.00,
-    "rho": -0.20,
-    "esg1": 35.0,
-    "esg2": 80.0,
-    "lambda_esg": 0.30,
-    "gamma": 3.0,
-    "num_points": 1001,
+    "min_esg_score": 50.0,
+    "target_esg_score": 70.0,
+    "lambda_esg": 0.70,
+    "top_n": 10,
+    "company_search": "",
 }
 
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 def go_to(page_name: str):
@@ -33,155 +27,125 @@ def go_to(page_name: str):
     st.rerun()
 
 
-# =========================================================
-# Finance / ESG functions
-# =========================================================
-def var_covar(sigmas: np.ndarray, rho: float) -> np.ndarray:
-    """2x2 covariance matrix."""
-    return np.array([
-        [sigmas[0] ** 2, rho * sigmas[0] * sigmas[1]],
-        [rho * sigmas[0] * sigmas[1], sigmas[1] ** 2]
-    ])
+# --------------------------------------------------
+# Data loading
+# --------------------------------------------------
+@st.cache_data
+def load_esg_data():
+    candidate_paths = [
+        Path("esg_data_2025_esgcombined_only.csv"),
+    ]
 
+    file_path = None
+    for path in candidate_paths:
+        if path.exists():
+            file_path = path
+            break
 
-def build_portfolio_grid(
-    mu: np.ndarray,
-    sigma: np.ndarray,
-    rho: float,
-    rf: float,
-    esg_scores: np.ndarray,
-    gamma: float,
-    lambda_esg: float,
-    num_points: int
-) -> pd.DataFrame:
-    """
-    Build long-only portfolio grid for 2 risky assets.
-    Inputs use decimals internally:
-      returns: 0.05 = 5%
-      volatilities: 0.09 = 9%
-      ESG scores: 0.35 = 35/100
-    """
-    cov = var_covar(sigma, rho)
-    weights = np.linspace(0, 1, num_points)
+    if file_path is None:
+        raise FileNotFoundError(
+            "Could not find 'esg_data_2025_esgcombined_only.csv'. "
+            "Place it in the same folder as app.py or inside a 'data/' folder."
+        )
 
-    rows = []
-    for w1 in weights:
-        w = np.array([w1, 1 - w1])
+    df = pd.read_csv(file_path)
 
-        exp_return = float(np.dot(mu, w))
-        variance = float(np.dot(w, np.dot(cov, w)))
-        std_dev = float(np.sqrt(max(variance, 0.0)))
-        esg_score = float(np.dot(esg_scores, w))
+    required_cols = {"comname", "value", "valuescore", "year", "fieldname"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-        sharpe = np.nan if std_dev == 0 else (exp_return - rf) / std_dev
+    # Keep only 2025 ESGCombinedScore rows
+    df = df[(df["year"] == 2025) & (df["fieldname"] == "ESGCombinedScore")].copy()
 
-        # Utility from your slide:
-        # U = E[R_p] - (gamma/2) * sigma_p^2 + lambda * s_bar
-        utility = exp_return - 0.5 * gamma * variance + lambda_esg * esg_score
-
-        rows.append({
-            "Weight Asset 1": w1,
-            "Weight Asset 2": 1 - w1,
-            "Expected Return": exp_return,
-            "Variance": variance,
-            "Std Dev": std_dev,
-            "ESG Score": esg_score,
-            "Sharpe Ratio": sharpe,
-            "Utility": utility,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def required_esg_threshold(df: pd.DataFrame, lambda_esg: float) -> float:
-    """
-    Convert lambda into a stricter ESG screen:
-    required ESG = min ESG + lambda * (max ESG - min ESG)
-    """
-    s_min = float(df["ESG Score"].min())
-    s_max = float(df["ESG Score"].max())
-    return s_min + lambda_esg * (s_max - s_min)
-
-
-def select_key_portfolios(df: pd.DataFrame):
-    """Return minimum-variance and tangency portfolios."""
-    valid = df[np.isfinite(df["Sharpe Ratio"])].copy()
-
-    idx_mvp = df["Std Dev"].idxmin()
-    idx_tan = valid["Sharpe Ratio"].idxmax()
-
-    mvp = df.loc[idx_mvp]
-    tangency = df.loc[idx_tan]
-
-    return mvp, tangency
-
-
-def summary_df(mvp: pd.Series, tangency: pd.Series, labels: tuple[str, str]) -> pd.DataFrame:
-    return pd.DataFrame([
-        {
-            "Portfolio": labels[0],
-            "Weight Asset 1": mvp["Weight Asset 1"],
-            "Weight Asset 2": mvp["Weight Asset 2"],
-            "Expected Return": mvp["Expected Return"],
-            "Std Dev": mvp["Std Dev"],
-            "ESG Score": mvp["ESG Score"],
-            "Sharpe Ratio": mvp["Sharpe Ratio"],
-            "Utility": mvp["Utility"],
-        },
-        {
-            "Portfolio": labels[1],
-            "Weight Asset 1": tangency["Weight Asset 1"],
-            "Weight Asset 2": tangency["Weight Asset 2"],
-            "Expected Return": tangency["Expected Return"],
-            "Std Dev": tangency["Std Dev"],
-            "ESG Score": tangency["ESG Score"],
-            "Sharpe Ratio": tangency["Sharpe Ratio"],
-            "Utility": tangency["Utility"],
-        },
-    ])
-
-
-def format_table(df: pd.DataFrame):
-    return df.style.format({
-        "Weight Asset 1": "{:.2%}",
-        "Weight Asset 2": "{:.2%}",
-        "Expected Return": "{:.2%}",
-        "Std Dev": "{:.2%}",
-        "ESG Score": "{:.2%}",
-        "Sharpe Ratio": "{:.3f}",
-        "Utility": "{:.4f}",
+    # Clean and rename
+    df = df[["comname", "value", "valuescore"]].copy()
+    df = df.rename(columns={
+        "comname": "Company",
+        "value": "ESG Grade",
+        "valuescore": "ESG Score Raw"
     })
 
+    df = df.dropna(subset=["Company", "ESG Score Raw"])
 
-# =========================================================
-# Page 1: Introduction
-# =========================================================
+    # Convert score to 0-100 and 0-1 versions
+    df["ESG Score (%)"] = df["ESG Score Raw"] * 100
+    df["ESG Score (0-1)"] = df["ESG Score Raw"]
+
+    # Sort once for stability
+    df = df.sort_values("Company").reset_index(drop=True)
+
+    return df
+
+
+def score_companies(df: pd.DataFrame, min_esg_score: float, target_esg_score: float, lambda_esg: float, company_search: str):
+    """
+    Preference score:
+    - lambda_esg weights 'how high' the ESG score is
+    - (1-lambda_esg) weights 'how close' the company is to the user's target ESG score
+
+    preference_score = λ * ESG_level + (1-λ) * closeness_to_target
+    """
+    result = df.copy()
+
+    # Optional company search
+    if company_search.strip():
+        result = result[result["Company"].str.contains(company_search.strip(), case=False, na=False)].copy()
+
+    # Minimum ESG threshold
+    result = result[result["ESG Score (%)"] >= min_esg_score].copy()
+
+    if result.empty:
+        return result
+
+    # Preference components
+    result["Closeness To Target"] = 1 - (result["ESG Score (%)"] - target_esg_score).abs() / 100
+    result["Closeness To Target"] = result["Closeness To Target"].clip(lower=0)
+
+    result["Preference Utility"] = (
+        lambda_esg * result["ESG Score (0-1)"]
+        + (1 - lambda_esg) * result["Closeness To Target"]
+    )
+
+    result = result.sort_values(
+        by=["Preference Utility", "ESG Score (%)"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    return result
+
+
+# --------------------------------------------------
+# Page 1: Intro
+# --------------------------------------------------
 if st.session_state.page == "intro":
-    st.title("ESG Portfolio Optimiser")
+    st.title("ESG Company Recommender")
 
     st.markdown(
-        r"""
-        This app compares:
+        """
+        This app uses your uploaded file:
 
-        - a **standard mean-variance setup** using **all portfolios**
-        - an **ESG-screened setup** using only portfolios that satisfy a **minimum portfolio ESG score**
+        **`esg_data_2025_esgcombined_only.csv`**
 
-        The investor utility is:
+        It only looks at:
+        - **2025**
+        - **ESGCombinedScore**
+        - each company's:
+          - name
+          - ESG letter grade
+          - numeric ESG score
 
-        \[
-        U = E[R_p] - \frac{\gamma}{2}\sigma_p^2 + \lambda \bar{s}
-        \]
+        The app then recommends companies based on the investor's ESG preferences.
+
+        ### How the recommendation works
+        Each company is ranked using a preference score:
+
+        **Preference Utility = λ × ESG Score + (1 − λ) × Closeness to Target ESG**
 
         where:
-
-        - \(E[R_p]\): expected portfolio return  
-        - \(\sigma_p\): portfolio standard deviation  
-        - \(\gamma\): risk aversion  
-        - \(\bar{s}\): weighted average portfolio ESG score  
-        - \(\lambda\): ESG preference intensity  
-
-        In the ESG graph, the feasible set is reduced by a minimum ESG requirement, which can lower the
-        tangency portfolio's Sharpe ratio and flatten the CML.
+        - **λ** controls how much the investor prioritises a higher ESG score
+        - **Target ESG** is the score the investor ideally wants
+        - **Minimum ESG** filters out companies below the acceptable level
         """
     )
 
@@ -189,395 +153,190 @@ if st.session_state.page == "intro":
         go_to("inputs")
 
 
-# =========================================================
+# --------------------------------------------------
 # Page 2: Inputs
-# =========================================================
+# --------------------------------------------------
 elif st.session_state.page == "inputs":
-    st.title("Portfolio Inputs")
+    st.title("Investor ESG Preferences")
 
-    st.write("Enter all percentages as values from 0 to 100.")
+    with st.form("preferences_form"):
+        st.subheader("Preference inputs")
 
-    with st.form("input_form"):
-        st.subheader("Asset 1 inputs")
-        mu1_pct = st.number_input(
-            "Expected return for Asset 1 (%)",
+        min_esg_score = st.number_input(
+            "Minimum acceptable ESG score (%)",
             min_value=0.0,
             max_value=100.0,
-            value=float(st.session_state.mu1_pct),
-            step=0.25,
-            format="%.2f",
-        )
-        sigma1_pct = st.number_input(
-            "Volatility for Asset 1 (%)",
-            min_value=0.01,
-            max_value=100.0,
-            value=float(st.session_state.sigma1_pct),
-            step=0.25,
-            format="%.2f",
-        )
-        esg1 = st.number_input(
-            "ESG score for Asset 1 (0 to 100)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(st.session_state.esg1),
+            value=float(st.session_state.min_esg_score),
             step=1.0,
             format="%.1f",
         )
 
-        st.markdown("---")
-
-        st.subheader("Asset 2 inputs")
-        mu2_pct = st.number_input(
-            "Expected return for Asset 2 (%)",
+        target_esg_score = st.number_input(
+            "Target ESG score (%)",
             min_value=0.0,
             max_value=100.0,
-            value=float(st.session_state.mu2_pct),
-            step=0.25,
-            format="%.2f",
-        )
-        sigma2_pct = st.number_input(
-            "Volatility for Asset 2 (%)",
-            min_value=0.01,
-            max_value=100.0,
-            value=float(st.session_state.sigma2_pct),
-            step=0.25,
-            format="%.2f",
-        )
-        esg2 = st.number_input(
-            "ESG score for Asset 2 (0 to 100)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(st.session_state.esg2),
+            value=float(st.session_state.target_esg_score),
             step=1.0,
             format="%.1f",
         )
 
-        st.markdown("---")
-
-        st.subheader("Portfolio inputs")
-        rf_pct = st.number_input(
-            "Risk-free rate (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(st.session_state.rf_pct),
-            step=0.25,
-            format="%.2f",
-        )
-        rho = st.slider(
-            "Correlation between Asset 1 and Asset 2",
-            min_value=-1.0,
-            max_value=1.0,
-            value=float(st.session_state.rho),
-            step=0.01,
-        )
-        num_points = st.slider(
-            "Number of portfolio weight points",
-            min_value=101,
-            max_value=5001,
-            value=int(st.session_state.num_points),
-            step=100,
-        )
-
-        st.markdown("---")
-
-        st.subheader("Investor preferences")
         lambda_esg = st.slider(
-            "ESG preference intensity λ",
+            "ESG preference λ (1 = prioritise highest ESG score, 0 = prioritise closeness to your target)",
             min_value=0.0,
             max_value=1.0,
             value=float(st.session_state.lambda_esg),
             step=0.01,
         )
-        gamma = st.number_input(
-            "Risk aversion γ",
-            min_value=0.0,
-            max_value=50.0,
-            value=float(st.session_state.gamma),
-            step=0.10,
-            format="%.2f",
+
+        top_n = st.slider(
+            "Number of recommendations to show",
+            min_value=1,
+            max_value=25,
+            value=int(st.session_state.top_n),
+            step=1,
+        )
+
+        company_search = st.text_input(
+            "Optional company name filter",
+            value=st.session_state.company_search
         )
 
         submitted = st.form_submit_button("Continue to results")
 
     if submitted:
-        st.session_state.mu1_pct = mu1_pct
-        st.session_state.mu2_pct = mu2_pct
-        st.session_state.sigma1_pct = sigma1_pct
-        st.session_state.sigma2_pct = sigma2_pct
-        st.session_state.esg1 = esg1
-        st.session_state.esg2 = esg2
-        st.session_state.rf_pct = rf_pct
-        st.session_state.rho = rho
-        st.session_state.num_points = num_points
+        st.session_state.min_esg_score = min_esg_score
+        st.session_state.target_esg_score = target_esg_score
         st.session_state.lambda_esg = lambda_esg
-        st.session_state.gamma = gamma
+        st.session_state.top_n = top_n
+        st.session_state.company_search = company_search
         go_to("results")
 
     if st.button("Back to introduction"):
         go_to("intro")
 
 
-# =========================================================
+# --------------------------------------------------
 # Page 3: Results
-# =========================================================
+# --------------------------------------------------
 elif st.session_state.page == "results":
     st.title("Results")
 
-    # Convert user inputs from % to decimals
-    mu = np.array([st.session_state.mu1_pct, st.session_state.mu2_pct]) / 100.0
-    sigma = np.array([st.session_state.sigma1_pct, st.session_state.sigma2_pct]) / 100.0
-    rf = st.session_state.rf_pct / 100.0
-    rho = st.session_state.rho
-    esg_scores = np.array([st.session_state.esg1, st.session_state.esg2]) / 100.0
-    lambda_esg = st.session_state.lambda_esg
-    gamma = st.session_state.gamma
-    num_points = st.session_state.num_points
+    try:
+        df = load_esg_data()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-    # All portfolios
-    df_all = build_portfolio_grid(
-        mu=mu,
-        sigma=sigma,
-        rho=rho,
-        rf=rf,
-        esg_scores=esg_scores,
-        gamma=gamma,
-        lambda_esg=lambda_esg,
-        num_points=num_points,
-    )
-
-    # ESG-screened portfolios
-    esg_cutoff = required_esg_threshold(df_all, lambda_esg)
-    df_esg = df_all[df_all["ESG Score"] >= esg_cutoff - 1e-12].copy()
-
-    # Safety fallback
-    if df_esg.empty:
-        idx_best_esg = df_all["ESG Score"].idxmax()
-        df_esg = df_all.loc[[idx_best_esg]].copy()
-
-    # Key portfolios
-    mvp_std, tan_std = select_key_portfolios(df_all)
-    mvp_esg, tan_esg = select_key_portfolios(df_esg)
-
-    std_summary = summary_df(
-        mvp_std,
-        tan_std,
-        labels=("Minimum Variance Portfolio", "Tangency Portfolio")
-    )
-
-    esg_summary = summary_df(
-        mvp_esg,
-        tan_esg,
-        labels=("ESG Minimum Variance Portfolio", "ESG Tangency Portfolio")
+    ranked = score_companies(
+        df=df,
+        min_esg_score=st.session_state.min_esg_score,
+        target_esg_score=st.session_state.target_esg_score,
+        lambda_esg=st.session_state.lambda_esg,
+        company_search=st.session_state.company_search,
     )
 
     st.markdown(
         f"""
-        **ESG screen used in Graph 2**  
-        Required portfolio ESG score = **{esg_cutoff * 100:.2f} / 100**
-
-        This threshold is implied by your ESG preference \( \lambda = {lambda_esg:.2f} \).
+        **Dataset summary**
+        - Companies available: **{len(df)}**
+        - Minimum acceptable ESG score: **{st.session_state.min_esg_score:.1f}%**
+        - Target ESG score: **{st.session_state.target_esg_score:.1f}%**
+        - ESG preference λ: **{st.session_state.lambda_esg:.2f}**
         """
     )
 
-    # -----------------------------------------------------
-    # Graph 1: Standard (all portfolios)
-    # -----------------------------------------------------
-    st.subheader("1) Standard mean-variance frontier and CML")
+    if ranked.empty:
+        st.warning("No companies match your filters. Try lowering the minimum ESG score or clearing the company search.")
+    else:
+        best = ranked.iloc[0]
+        top_df = ranked.head(st.session_state.top_n).copy()
 
-    fig1, ax1 = plt.subplots(figsize=(10, 6))
+        st.subheader("Best match")
 
-    x_all = df_all["Std Dev"] * 100
-    y_all = df_all["Expected Return"] * 100
-    rf_plot = rf * 100
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Company", best["Company"])
+        col2.metric("ESG Grade", best["ESG Grade"])
+        col3.metric("ESG Score", f"{best['ESG Score (%)']:.1f}%")
+        col4.metric("Preference Utility", f"{best['Preference Utility']:.3f}")
 
-    ax1.plot(
-        x_all,
-        y_all,
-        color="blue",
-        linewidth=2,
-        label="Mean-variance frontier (all portfolios)"
-    )
+        st.subheader("Summary table")
 
-    # CML
-    x_max_1 = max(float(x_all.max()), float(tan_std["Std Dev"] * 100)) * 1.10
-    sigma_line_1 = np.linspace(0, x_max_1, 200)
-    cml_1 = rf_plot + float(tan_std["Sharpe Ratio"]) * sigma_line_1
+        summary = pd.DataFrame([
+            {
+                "Recommended Company": best["Company"],
+                "ESG Grade": best["ESG Grade"],
+                "ESG Score (%)": best["ESG Score (%)"],
+                "Closeness To Target": best["Closeness To Target"],
+                "Preference Utility": best["Preference Utility"],
+            }
+        ])
 
-    ax1.plot(
-        sigma_line_1,
-        cml_1,
-        color="blue",
-        linestyle="--",
-        linewidth=2,
-        label="CML"
-    )
-
-    # Risk-free point
-    ax1.scatter(
-        [0],
-        [rf_plot],
-        color="black",
-        s=70,
-        label="Risk-free rate"
-    )
-
-    # MVP
-    ax1.scatter(
-        [mvp_std["Std Dev"] * 100],
-        [mvp_std["Expected Return"] * 100],
-        color="blue",
-        marker="o",
-        s=120,
-        label="Minimum variance portfolio"
-    )
-
-    # Tangency
-    ax1.scatter(
-        [tan_std["Std Dev"] * 100],
-        [tan_std["Expected Return"] * 100],
-        color="blue",
-        marker="*",
-        s=220,
-        label="Tangency portfolio"
-    )
-
-    ax1.annotate(
-        "MVP",
-        xy=(mvp_std["Std Dev"] * 100, mvp_std["Expected Return"] * 100),
-        xytext=(8, 8),
-        textcoords="offset points"
-    )
-    ax1.annotate(
-        "Tangency",
-        xy=(tan_std["Std Dev"] * 100, tan_std["Expected Return"] * 100),
-        xytext=(8, -14),
-        textcoords="offset points"
-    )
-
-    ax1.set_xlabel("Portfolio standard deviation (%)")
-    ax1.set_ylabel("Expected return (%)")
-    ax1.set_title("Standard frontier: all portfolios")
-    ax1.set_xlim(left=0)
-    ax1.set_ylim(bottom=0)
-    ax1.grid(True)
-    ax1.legend()
-
-    st.pyplot(fig1)
-
-    st.subheader("Summary table: Standard graph")
-    st.dataframe(format_table(std_summary), use_container_width=True)
-
-    # -----------------------------------------------------
-    # Graph 2: ESG-screened only
-    # -----------------------------------------------------
-    st.subheader("2) ESG-screened frontier and CML")
-
-    fig2, ax2 = plt.subplots(figsize=(10, 6))
-
-    x_esg = df_esg["Std Dev"] * 100
-    y_esg = df_esg["Expected Return"] * 100
-
-    ax2.plot(
-        x_esg,
-        y_esg,
-        color="green",
-        linewidth=2.5,
-        label="ESG frontier (portfolios meeting minimum ESG score)"
-    )
-
-    # ESG CML
-    x_max_2 = max(float(x_esg.max()), float(tan_esg["Std Dev"] * 100)) * 1.10
-    sigma_line_2 = np.linspace(0, x_max_2, 200)
-    cml_2 = rf_plot + float(tan_esg["Sharpe Ratio"]) * sigma_line_2
-
-    ax2.plot(
-        sigma_line_2,
-        cml_2,
-        color="green",
-        linestyle="--",
-        linewidth=2,
-        label="ESG CML"
-    )
-
-    # Risk-free point
-    ax2.scatter(
-        [0],
-        [rf_plot],
-        color="black",
-        s=70,
-        label="Risk-free rate"
-    )
-
-    # ESG MVP
-    ax2.scatter(
-        [mvp_esg["Std Dev"] * 100],
-        [mvp_esg["Expected Return"] * 100],
-        color="green",
-        marker="o",
-        s=120,
-        label="ESG minimum variance portfolio"
-    )
-
-    # ESG Tangency
-    ax2.scatter(
-        [tan_esg["Std Dev"] * 100],
-        [tan_esg["Expected Return"] * 100],
-        color="green",
-        marker="*",
-        s=220,
-        label="ESG tangency portfolio"
-    )
-
-    ax2.annotate(
-        "ESG MVP",
-        xy=(mvp_esg["Std Dev"] * 100, mvp_esg["Expected Return"] * 100),
-        xytext=(8, 8),
-        textcoords="offset points"
-    )
-    ax2.annotate(
-        "ESG Tangency",
-        xy=(tan_esg["Std Dev"] * 100, tan_esg["Expected Return"] * 100),
-        xytext=(8, -14),
-        textcoords="offset points"
-    )
-
-    ax2.set_xlabel("Portfolio standard deviation (%)")
-    ax2.set_ylabel("Expected return (%)")
-    ax2.set_title("ESG-screened frontier: portfolios with minimum ESG score")
-    ax2.set_xlim(left=0)
-    ax2.set_ylim(bottom=0)
-    ax2.grid(True)
-    ax2.legend()
-
-    st.pyplot(fig2)
-
-    st.subheader("Summary table: ESG graph")
-    st.dataframe(format_table(esg_summary), use_container_width=True)
-
-    # Optional full table
-    with st.expander("Show full portfolio table"):
         st.dataframe(
-            df_all.style.format({
-                "Weight Asset 1": "{:.2%}",
-                "Weight Asset 2": "{:.2%}",
-                "Expected Return": "{:.2%}",
-                "Variance": "{:.5f}",
-                "Std Dev": "{:.2%}",
-                "ESG Score": "{:.2%}",
-                "Sharpe Ratio": "{:.3f}",
-                "Utility": "{:.4f}",
+            summary.style.format({
+                "ESG Score (%)": "{:.1f}",
+                "Closeness To Target": "{:.3f}",
+                "Preference Utility": "{:.3f}",
             }),
-            use_container_width=True,
-            height=350
+            use_container_width=True
         )
 
-    csv_data = df_all.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download full portfolio table as CSV",
-        data=csv_data,
-        file_name="esg_portfolio_results.csv",
-        mime="text/csv"
-    )
+        st.subheader(f"Top {st.session_state.top_n} recommendations")
+
+        st.dataframe(
+            top_df[[
+                "Company",
+                "ESG Grade",
+                "ESG Score (%)",
+                "Closeness To Target",
+                "Preference Utility"
+            ]].style.format({
+                "ESG Score (%)": "{:.1f}",
+                "Closeness To Target": "{:.3f}",
+                "Preference Utility": "{:.3f}",
+            }),
+            use_container_width=True
+        )
+
+        st.subheader("Recommendation chart")
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        plot_df = top_df.sort_values("Preference Utility", ascending=True)
+
+        ax.barh(plot_df["Company"], plot_df["Preference Utility"])
+        ax.set_xlabel("Preference Utility")
+        ax.set_ylabel("Company")
+        ax.set_title("Top ESG Recommendations")
+
+        st.pyplot(fig)
+
+        st.subheader("ESG score distribution")
+
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        ax2.hist(df["ESG Score (%)"], bins=12)
+        ax2.axvline(st.session_state.min_esg_score, linestyle="--", label="Minimum ESG")
+        ax2.axvline(st.session_state.target_esg_score, linestyle=":", label="Target ESG")
+        ax2.set_xlabel("ESG Score (%)")
+        ax2.set_ylabel("Number of companies")
+        ax2.set_title("2025 ESGCombinedScore distribution")
+        ax2.legend()
+
+        st.pyplot(fig2)
+
+        download_cols = top_df[[
+            "Company",
+            "ESG Grade",
+            "ESG Score (%)",
+            "Closeness To Target",
+            "Preference Utility"
+        ]].copy()
+
+        csv_data = download_cols.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download recommendations as CSV",
+            data=csv_data,
+            file_name="esg_recommendations_2025.csv",
+            mime="text/csv"
+        )
 
     col1, col2 = st.columns(2)
     with col1:
