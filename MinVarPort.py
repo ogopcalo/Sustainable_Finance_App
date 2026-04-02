@@ -166,8 +166,7 @@ def load_company_esg_data() -> pd.DataFrame:
     """
     candidate_paths = [
         Path("esg_data_2025_esgcombined_only.csv"),
-        Path("data/esg_data_2025_esgcombined_only.csv"),
-        Path("/mnt/data/esg_data_2025_esgcombined_only.csv"),
+        Path("/mnt/esg_data_2025_esgcombined_only.csv"),
     ]
 
     file_path = None
