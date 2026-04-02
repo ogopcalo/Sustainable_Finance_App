@@ -1,23 +1,27 @@
 import streamlit as st
-import pandas as pd
 import matplotlib.pyplot as plt
-from pathlib import Path
+import numpy as np
+import pandas as pd
 
-st.set_page_config(page_title="ESG Company Recommender", layout="wide")
+st.set_page_config(page_title="Efficient Frontier App", layout="wide")
 
-# --------------------------------------------------
-# Session state
-# --------------------------------------------------
-DEFAULTS = {
+
+# -----------------------------
+# Session state defaults
+# -----------------------------
+defaults = {
     "page": "intro",
-    "min_esg_score": 50.0,
-    "target_esg_score": 70.0,
-    "lambda_esg": 0.70,
-    "top_n": 10,
-    "company_search": "",
+    "mu1": 0.05,
+    "mu2": 0.12,
+    "sigma1": 0.09,
+    "sigma2": 0.20,
+    "rf": 0.02,
+    "selected_rhos": [-1.0, -0.2, 0.0],
+    "detailed_rho": -0.2,
+    "num_points": 1001,
 }
 
-for key, value in DEFAULTS.items():
+for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
@@ -27,321 +31,508 @@ def go_to(page_name: str):
     st.rerun()
 
 
-# --------------------------------------------------
-# Data loading
-# --------------------------------------------------
-@st.cache_data
-def load_esg_data():
-    candidate_paths = [
-        Path("esg_data_2025_esgcombined_only.csv"),
-    ]
-
-    file_path = None
-    for path in candidate_paths:
-        if path.exists():
-            file_path = path
-            break
-
-    if file_path is None:
-        raise FileNotFoundError(
-            "Could not find 'esg_data_2025_esgcombined_only.csv'. "
-            "Place it in the same folder as app.py or inside a 'data/' folder."
-        )
-
-    df = pd.read_csv(file_path)
-
-    required_cols = {"comname", "value", "valuescore", "year", "fieldname"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-    # Keep only 2025 ESGCombinedScore rows
-    df = df[(df["year"] == 2025) & (df["fieldname"] == "ESGCombinedScore")].copy()
-
-    # Clean and rename
-    df = df[["comname", "value", "valuescore"]].copy()
-    df = df.rename(columns={
-        "comname": "Company",
-        "value": "ESG Grade",
-        "valuescore": "ESG Score Raw"
-    })
-
-    df = df.dropna(subset=["Company", "ESG Score Raw"])
-
-    # Convert score to 0-100 and 0-1 versions
-    df["ESG Score (%)"] = df["ESG Score Raw"] * 100
-    df["ESG Score (0-1)"] = df["ESG Score Raw"]
-
-    # Sort once for stability
-    df = df.sort_values("Company").reset_index(drop=True)
-
-    return df
+# -----------------------------
+# Finance functions
+# -----------------------------
+def var_covar(sigmas, rho):
+    return np.array([
+        [sigmas[0] ** 2, rho * sigmas[0] * sigmas[1]],
+        [rho * sigmas[0] * sigmas[1], sigmas[1] ** 2]
+    ])
 
 
-def score_companies(df: pd.DataFrame, min_esg_score: float, target_esg_score: float, lambda_esg: float, company_search: str):
-    """
-    Preference score:
-    - lambda_esg weights 'how high' the ESG score is
-    - (1-lambda_esg) weights 'how close' the company is to the user's target ESG score
+def portfolio_stats(mu, sigma, rho, w1, rf):
+    cov = var_covar(sigma, rho)
+    w = np.array([w1, 1 - w1])
 
-    preference_score = λ * ESG_level + (1-λ) * closeness_to_target
-    """
-    result = df.copy()
+    port_return = np.dot(mu, w)
+    port_variance = np.dot(w, np.dot(cov, w))
+    port_std = np.sqrt(port_variance)
 
-    # Optional company search
-    if company_search.strip():
-        result = result[result["Company"].str.contains(company_search.strip(), case=False, na=False)].copy()
+    sharpe = np.nan
+    if port_std > 0:
+        sharpe = (port_return - rf) / port_std
 
-    # Minimum ESG threshold
-    result = result[result["ESG Score (%)"] >= min_esg_score].copy()
-
-    if result.empty:
-        return result
-
-    # Preference components
-    result["Closeness To Target"] = 1 - (result["ESG Score (%)"] - target_esg_score).abs() / 100
-    result["Closeness To Target"] = result["Closeness To Target"].clip(lower=0)
-
-    result["Preference Utility"] = (
-        lambda_esg * result["ESG Score (0-1)"]
-        + (1 - lambda_esg) * result["Closeness To Target"]
-    )
-
-    result = result.sort_values(
-        by=["Preference Utility", "ESG Score (%)"],
-        ascending=[False, False]
-    ).reset_index(drop=True)
-
-    return result
+    return port_return, port_std, sharpe
 
 
-# --------------------------------------------------
-# Page 1: Intro
-# --------------------------------------------------
+def eff_front(mu, sigma, rho, weights, rf):
+    returns = []
+    std_devs = []
+    sharpes = []
+
+    for w1 in weights:
+        ret, std, sharpe = portfolio_stats(mu, sigma, rho, w1, rf)
+        returns.append(ret)
+        std_devs.append(std)
+        sharpes.append(sharpe)
+
+    return np.array(returns), np.array(std_devs), np.array(sharpes)
+
+
+def key_portfolios(mu, sigma, rho, weights, rf):
+    returns, std_devs, sharpes = eff_front(mu, sigma, rho, weights, rf)
+
+    min_var_idx = np.argmin(std_devs)
+    max_sharpe_idx = np.nanargmax(sharpes)
+
+    summary = {
+        "Minimum Variance": {
+            "Weight Asset 1": weights[min_var_idx],
+            "Weight Asset 2": 1 - weights[min_var_idx],
+            "Expected Return": returns[min_var_idx],
+            "Standard Deviation": std_devs[min_var_idx],
+            "Sharpe Ratio": sharpes[min_var_idx],
+        },
+        "Maximum Sharpe": {
+            "Weight Asset 1": weights[max_sharpe_idx],
+            "Weight Asset 2": 1 - weights[max_sharpe_idx],
+            "Expected Return": returns[max_sharpe_idx],
+            "Standard Deviation": std_devs[max_sharpe_idx],
+            "Sharpe Ratio": sharpes[max_sharpe_idx],
+        },
+    }
+
+    return summary, returns, std_devs, sharpes
+
+
+# -----------------------------
+# Page 1: Introduction
+# -----------------------------
 if st.session_state.page == "intro":
-    st.title("ESG Company Recommender")
+    st.title("Efficient Frontier App")
 
     st.markdown(
         """
-        This app uses your uploaded file:
+        Welcome to this portfolio analysis app.
 
-        **`esg_data_2025_esgcombined_only.csv`**
+        This tool lets you:
+        - enter expected returns and volatilities for two assets,
+        - choose portfolio assumptions such as correlation and the risk-free rate,
+        - view the portfolio frontier,
+        - identify the minimum-variance and maximum-Sharpe portfolios.
 
-        It only looks at:
-        - **2025**
-        - **ESGCombinedScore**
-        - each company's:
-          - name
-          - ESG letter grade
-          - numeric ESG score
-
-        The app then recommends companies based on the investor's ESG preferences.
-
-        ### How the recommendation works
-        Each company is ranked using a preference score:
-
-        **Preference Utility = λ × ESG Score + (1 − λ) × Closeness to Target ESG**
-
-        where:
-        - **λ** controls how much the investor prioritises a higher ESG score
-        - **Target ESG** is the score the investor ideally wants
-        - **Minimum ESG** filters out companies below the acceptable level
+        Click below to continue to the input page.
         """
     )
 
-    if st.button("Continue"):
-        go_to("inputs")
+    st.button("Continue", on_click=go_to, args=("inputs",))
 
 
-# --------------------------------------------------
+# -----------------------------
 # Page 2: Inputs
-# --------------------------------------------------
+# -----------------------------
 elif st.session_state.page == "inputs":
-    st.title("Investor ESG Preferences")
+    st.title("Portfolio Inputs")
 
-    with st.form("preferences_form"):
-        st.subheader("Preference inputs")
+    st.write("Enter the assumptions for Asset 1, Asset 2, and the portfolio settings.")
 
-        min_esg_score = st.number_input(
-            "Minimum acceptable ESG score (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(st.session_state.min_esg_score),
-            step=1.0,
-            format="%.1f",
+    with st.form("portfolio_input_form"):
+        st.subheader("Asset 1 inputs")
+        mu1 = st.number_input(
+            "Expected return for Asset 1",
+            min_value=0.00,
+            max_value=1.00,
+            value=float(st.session_state.mu1),
+            step=0.01
+        )
+        sigma1 = st.number_input(
+            "Volatility for Asset 1",
+            min_value=0.001,
+            max_value=1.00,
+            value=float(st.session_state.sigma1),
+            step=0.01
         )
 
-        target_esg_score = st.number_input(
-            "Target ESG score (%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(st.session_state.target_esg_score),
-            step=1.0,
-            format="%.1f",
+        st.markdown("---")
+
+        st.subheader("Asset 2 inputs")
+        mu2 = st.number_input(
+            "Expected return for Asset 2",
+            min_value=0.00,
+            max_value=1.00,
+            value=float(st.session_state.mu2),
+            step=0.01
+        )
+        sigma2 = st.number_input(
+            "Volatility for Asset 2",
+            min_value=0.001,
+            max_value=1.00,
+            value=float(st.session_state.sigma2),
+            step=0.01
         )
 
-        lambda_esg = st.slider(
-            "ESG preference λ (1 = prioritise highest ESG score, 0 = prioritise closeness to your target)",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(st.session_state.lambda_esg),
-            step=0.01,
+        st.markdown("---")
+
+        st.subheader("Portfolio inputs")
+        rf = st.number_input(
+            "Risk-free rate",
+            min_value=0.00,
+            max_value=1.00,
+            value=float(st.session_state.rf),
+            step=0.005
         )
 
-        top_n = st.slider(
-            "Number of recommendations to show",
-            min_value=1,
-            max_value=25,
-            value=int(st.session_state.top_n),
-            step=1,
+        available_rhos = [-1.0, -0.8, -0.5, -0.2, 0.0, 0.2, 0.5, 0.8, 1.0]
+
+        selected_rhos = st.multiselect(
+            "Correlations to plot",
+            options=available_rhos,
+            default=st.session_state.selected_rhos
         )
 
-        company_search = st.text_input(
-            "Optional company name filter",
-            value=st.session_state.company_search
+        if not selected_rhos:
+            selected_rhos = [0.0]
+
+        detailed_rho = st.selectbox(
+            "Correlation to use for the summary results",
+            options=selected_rhos,
+            index=selected_rhos.index(st.session_state.detailed_rho)
+            if st.session_state.detailed_rho in selected_rhos else 0
+        )
+
+        num_points = st.slider(
+            "Number of weight points",
+            min_value=101,
+            max_value=5001,
+            value=int(st.session_state.num_points),
+            step=100
         )
 
         submitted = st.form_submit_button("Continue to results")
 
-    if submitted:
-        st.session_state.min_esg_score = min_esg_score
-        st.session_state.target_esg_score = target_esg_score
-        st.session_state.lambda_esg = lambda_esg
-        st.session_state.top_n = top_n
-        st.session_state.company_search = company_search
-        go_to("results")
+        if submitted:
+            st.session_state.mu1 = mu1
+            st.session_state.mu2 = mu2
+            st.session_state.sigma1 = sigma1
+            st.session_state.sigma2 = sigma2
+            st.session_state.rf = rf
+            st.session_state.selected_rhos = selected_rhos
+            st.session_state.detailed_rho = detailed_rho
+            st.session_state.num_points = num_points
+            st.session_state.page = "results"
+            st.rerun()
 
-    if st.button("Back to introduction"):
-        go_to("intro")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Back to introduction"):
+            go_to("intro")
 
 
-# --------------------------------------------------
+# -----------------------------
 # Page 3: Results
-# --------------------------------------------------
+# -----------------------------
 elif st.session_state.page == "results":
     st.title("Results")
 
-    try:
-        df = load_esg_data()
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    mu = np.array([st.session_state.mu1, st.session_state.mu2])
+    sigma = np.array([st.session_state.sigma1, st.session_state.sigma2])
+    rf = st.session_state.rf
+    selected_rhos = st.session_state.selected_rhos
+    detailed_rho = st.session_state.detailed_rho
+    weights = np.linspace(0, 1, st.session_state.num_points)
 
-    ranked = score_companies(
-        df=df,
-        min_esg_score=st.session_state.min_esg_score,
-        target_esg_score=st.session_state.target_esg_score,
-        lambda_esg=st.session_state.lambda_esg,
-        company_search=st.session_state.company_search,
+    summary, returns, std_devs, sharpes = key_portfolios(
+        mu, sigma, detailed_rho, weights, rf
     )
 
-    st.markdown(
-        f"""
-        **Dataset summary**
-        - Companies available: **{len(df)}**
-        - Minimum acceptable ESG score: **{st.session_state.min_esg_score:.1f}%**
-        - Target ESG score: **{st.session_state.target_esg_score:.1f}%**
-        - ESG preference λ: **{st.session_state.lambda_esg:.2f}**
-        """
+    st.subheader("Efficient frontier chart")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for rho in selected_rhos:
+        curve_returns, curve_stds, _ = eff_front(mu, sigma, rho, weights, rf)
+        ax.plot(curve_stds, curve_returns, label=f"ρ = {rho}")
+
+    ax.scatter(
+        summary["Minimum Variance"]["Standard Deviation"],
+        summary["Minimum Variance"]["Expected Return"],
+        s=90,
+        marker="o",
+        label=f"Min-Variance (ρ={detailed_rho})"
     )
 
-    if ranked.empty:
-        st.warning("No companies match your filters. Try lowering the minimum ESG score or clearing the company search.")
-    else:
-        best = ranked.iloc[0]
-        top_df = ranked.head(st.session_state.top_n).copy()
+    ax.scatter(
+        summary["Maximum Sharpe"]["Standard Deviation"],
+        summary["Maximum Sharpe"]["Expected Return"],
+        s=180,
+        marker="*",
+        label=f"Max-Sharpe (ρ={detailed_rho})"
+    )
 
-        st.subheader("Best match")
+    ax.set_xlabel("Portfolio Standard Deviation")
+    ax.set_ylabel("Portfolio Expected Return")
+    ax.set_title("Portfolio Frontier")
+    ax.grid(True)
+    ax.legend()
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Company", best["Company"])
-        col2.metric("ESG Grade", best["ESG Grade"])
-        col3.metric("ESG Score", f"{best['ESG Score (%)']:.1f}%")
-        col4.metric("Preference Utility", f"{best['Preference Utility']:.3f}")
+    st.pyplot(fig)
 
-        st.subheader("Summary table")
+    st.subheader("Summary table")
 
-        summary = pd.DataFrame([
-            {
-                "Recommended Company": best["Company"],
-                "ESG Grade": best["ESG Grade"],
-                "ESG Score (%)": best["ESG Score (%)"],
-                "Closeness To Target": best["Closeness To Target"],
-                "Preference Utility": best["Preference Utility"],
-            }
-        ])
+    summary_df = pd.DataFrame(summary).T.reset_index().rename(columns={"index": "Portfolio"})
+    st.dataframe(
+        summary_df.style.format({
+            "Weight Asset 1": "{:.2%}",
+            "Weight Asset 2": "{:.2%}",
+            "Expected Return": "{:.2%}",
+            "Standard Deviation": "{:.2%}",
+            "Sharpe Ratio": "{:.3f}",
+        }),
+        use_container_width=True
+    )
 
-        st.dataframe(
-            summary.style.format({
-                "ESG Score (%)": "{:.1f}",
-                "Closeness To Target": "{:.3f}",
-                "Preference Utility": "{:.3f}",
-            }),
-            use_container_width=True
-        )
+    st.subheader("Full frontier table")
 
-        st.subheader(f"Top {st.session_state.top_n} recommendations")
+    frontier_df = pd.DataFrame({
+        "Weight Asset 1": weights,
+        "Weight Asset 2": 1 - weights,
+        "Expected Return": returns,
+        "Standard Deviation": std_devs,
+        "Sharpe Ratio": sharpes
+    })
 
-        st.dataframe(
-            top_df[[
-                "Company",
-                "ESG Grade",
-                "ESG Score (%)",
-                "Closeness To Target",
-                "Preference Utility"
-            ]].style.format({
-                "ESG Score (%)": "{:.1f}",
-                "Closeness To Target": "{:.3f}",
-                "Preference Utility": "{:.3f}",
-            }),
-            use_container_width=True
-        )
+    st.dataframe(
+        frontier_df.style.format({
+            "Weight Asset 1": "{:.2%}",
+            "Weight Asset 2": "{:.2%}",
+            "Expected Return": "{:.2%}",
+            "Standard Deviation": "{:.2%}",
+            "Sharpe Ratio": "{:.3f}",
+        }),
+        use_container_width=True,
+        height=350
+    )
 
-        st.subheader("Recommendation chart")
+    csv_data = frontier_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download frontier table as CSV",
+        data=csv_data,
+        file_name="frontier_results.csv",
+        mime="text/csv"
+    )
 
-        fig, ax = plt.subplots(figsize=(10, 6))
-        plot_df = top_df.sort_values("Preference Utility", ascending=True)
-
-        ax.barh(plot_df["Company"], plot_df["Preference Utility"])
-        ax.set_xlabel("Preference Utility")
-        ax.set_ylabel("Company")
-        ax.set_title("Top ESG Recommendations")
-
-        st.pyplot(fig)
-
-        st.subheader("ESG score distribution")
-
-        fig2, ax2 = plt.subplots(figsize=(10, 6))
-        ax2.hist(df["ESG Score (%)"], bins=12)
-        ax2.axvline(st.session_state.min_esg_score, linestyle="--", label="Minimum ESG")
-        ax2.axvline(st.session_state.target_esg_score, linestyle=":", label="Target ESG")
-        ax2.set_xlabel("ESG Score (%)")
-        ax2.set_ylabel("Number of companies")
-        ax2.set_title("2025 ESGCombinedScore distribution")
-        ax2.legend()
-
-        st.pyplot(fig2)
-
-        download_cols = top_df[[
-            "Company",
-            "ESG Grade",
-            "ESG Score (%)",
-            "Closeness To Target",
-            "Preference Utility"
-        ]].copy()
-
-        csv_data = download_cols.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download recommendations as CSV",
-            data=csv_data,
-            file_name="esg_recommendations_2025.csv",
-            mime="text/csv"
-        )
-
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("Back to inputs"):
             go_to("inputs")
     with col2:
         if st.button("Start over"):
             go_to("intro")
+detailed_rho = st.sidebar.selectbox(
+    "Correlation for detailed portfolio metrics",
+    options=selected_rhos,
+    index=0
+)
+
+num_points = st.sidebar.slider("Number of weight points", 101, 5001, 1001, 100)
+
+mu = np.array([mu1, mu2])
+sigma = np.array([sigma1, sigma2])
+weights = np.linspace(0, 1, num_points)
+
+# -----------------------------
+# Functions
+# -----------------------------
+def var_covar(sigma, rho):
+    """Variance-covariance matrix for two assets."""
+    return np.array([
+        [sigma[0] ** 2, rho * sigma[0] * sigma[1]],
+        [rho * sigma[0] * sigma[1], sigma[1] ** 2]
+    ])
+
+
+def portfolio_stats(mu, sigma, rho, w1, rf):
+    """Return portfolio return, std dev, and Sharpe ratio."""
+    cov = var_covar(sigma, rho)
+    w = np.array([w1, 1 - w1])
+
+    port_return = np.dot(mu, w)
+    port_variance = np.dot(w, np.dot(cov, w))
+    port_std = np.sqrt(port_variance)
+
+    if port_std > 0:
+        sharpe = (port_return - rf) / port_std
+    else:
+        sharpe = np.nan
+
+    return port_return, port_std, sharpe
+
+
+def eff_front(mu, sigma, rho, weights, rf):
+    """Compute frontier values over a grid of portfolio weights."""
+    returns = []
+    std_devs = []
+    sharpes = []
+
+    for w1 in weights:
+        ret_p, std_p, sharpe_p = portfolio_stats(mu, sigma, rho, w1, rf)
+        returns.append(ret_p)
+        std_devs.append(std_p)
+        sharpes.append(sharpe_p)
+
+    return np.array(returns), np.array(std_devs), np.array(sharpes)
+
+
+def key_portfolios(mu, sigma, rho, weights, rf):
+    """Find min-variance and max-Sharpe portfolios."""
+    returns, std_devs, sharpes = eff_front(mu, sigma, rho, weights, rf)
+
+    min_var_idx = np.argmin(std_devs)
+    max_sharpe_idx = np.nanargmax(sharpes)
+
+    results = {
+        "min_var": {
+            "w1": weights[min_var_idx],
+            "w2": 1 - weights[min_var_idx],
+            "return": returns[min_var_idx],
+            "std": std_devs[min_var_idx],
+            "sharpe": sharpes[min_var_idx]
+        },
+        "max_sharpe": {
+            "w1": weights[max_sharpe_idx],
+            "w2": 1 - weights[max_sharpe_idx],
+            "return": returns[max_sharpe_idx],
+            "std": std_devs[max_sharpe_idx],
+            "sharpe": sharpes[max_sharpe_idx]
+        }
+    }
+
+    return results, returns, std_devs, sharpes
+
+
+# -----------------------------
+# Main layout
+# -----------------------------
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    with _lock:
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for rho in selected_rhos:
+            returns, std_devs, _ = eff_front(mu, sigma, rho, weights, rf)
+            ax.plot(std_devs, returns, label=f"ρ = {rho}")
+
+        # highlight detailed rho portfolios
+        detail_results, detail_returns, detail_stds, detail_sharpes = key_portfolios(
+            mu, sigma, detailed_rho, weights, rf
+        )
+
+        ax.scatter(
+            detail_results["min_var"]["std"],
+            detail_results["min_var"]["return"],
+            marker="o",
+            s=80,
+            label=f"Min-Var (ρ={detailed_rho})"
+        )
+
+        ax.scatter(
+            detail_results["max_sharpe"]["std"],
+            detail_results["max_sharpe"]["return"],
+            marker="*",
+            s=180,
+            label=f"Max-Sharpe (ρ={detailed_rho})"
+        )
+
+        ax.set_xlabel("Portfolio Standard Deviation")
+        ax.set_ylabel("Portfolio Expected Return")
+        ax.set_title("Portfolio Frontier for Different Correlations")
+        ax.grid(True)
+        ax.legend()
+
+        st.pyplot(fig)
+
+with col2:
+    st.subheader("Current inputs")
+    st.write(f"**Asset 1 expected return:** {mu1:.2%}")
+    st.write(f"**Asset 2 expected return:** {mu2:.2%}")
+    st.write(f"**Asset 1 volatility:** {sigma1:.2%}")
+    st.write(f"**Asset 2 volatility:** {sigma2:.2%}")
+    st.write(f"**Risk-free rate:** {rf:.2%}")
+    st.write(f"**Detailed correlation:** {detailed_rho}")
+
+# -----------------------------
+# Detailed metrics table
+# -----------------------------
+results, returns, std_devs, sharpes = key_portfolios(mu, sigma, detailed_rho, weights, rf)
+
+summary_df = pd.DataFrame([
+    {
+        "Portfolio": "Minimum Variance",
+        "Weight Asset 1": results["min_var"]["w1"],
+        "Weight Asset 2": results["min_var"]["w2"],
+        "Expected Return": results["min_var"]["return"],
+        "Standard Deviation": results["min_var"]["std"],
+        "Sharpe Ratio": results["min_var"]["sharpe"]
+    },
+    {
+        "Portfolio": "Maximum Sharpe",
+        "Weight Asset 1": results["max_sharpe"]["w1"],
+        "Weight Asset 2": results["max_sharpe"]["w2"],
+        "Expected Return": results["max_sharpe"]["return"],
+        "Standard Deviation": results["max_sharpe"]["std"],
+        "Sharpe Ratio": results["max_sharpe"]["sharpe"]
+    }
+])
+
+st.subheader(f"Detailed portfolio metrics for ρ = {detailed_rho}")
+st.dataframe(
+    summary_df.style.format({
+        "Weight Asset 1": "{:.2%}",
+        "Weight Asset 2": "{:.2%}",
+        "Expected Return": "{:.2%}",
+        "Standard Deviation": "{:.2%}",
+        "Sharpe Ratio": "{:.3f}"
+    }),
+    use_container_width=True
+)
+
+# -----------------------------
+# Full frontier data table
+# -----------------------------
+frontier_df = pd.DataFrame({
+    "Weight Asset 1": weights,
+    "Weight Asset 2": 1 - weights,
+    "Expected Return": returns,
+    "Standard Deviation": std_devs,
+    "Sharpe Ratio": sharpes
+})
+
+st.subheader("Frontier data")
+st.dataframe(
+    frontier_df.style.format({
+        "Weight Asset 1": "{:.2%}",
+        "Weight Asset 2": "{:.2%}",
+        "Expected Return": "{:.2%}",
+        "Standard Deviation": "{:.2%}",
+        "Sharpe Ratio": "{:.3f}"
+    }),
+    use_container_width=True,
+    height=350
+)
+
+csv_data = frontier_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download frontier data as CSV",
+    data=csv_data,
+    file_name=f"frontier_rho_{detailed_rho}.csv",
+    mime="text/csv"
+)
+
+# -----------------------------
+# Optional explanation
+# -----------------------------
+with st.expander("What this app shows"):
+    st.markdown(
+        """
+        - **Expected return** is the weighted average of the two assets' expected returns.
+        - **Portfolio risk** depends on both individual volatilities and the correlation between assets.
+        - **Minimum-variance portfolio** is the portfolio with the lowest standard deviation.
+        - **Maximum-Sharpe portfolio** is the portfolio with the highest risk-adjusted return:
+        
+        \[
+        \text{Sharpe Ratio} = \frac{E(R_p) - R_f}{\sigma_p}
+        \]
+        """
+    )
