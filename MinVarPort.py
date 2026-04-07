@@ -186,11 +186,11 @@ def load_firm_universe_data() -> pd.DataFrame:
     """
     esg_paths = [
         Path("CRSP_2024_ESGCombinedScore.xlsx"),
-        Path("/mnt/data/CRSP_2024_ESGCombinedScore.xlsx"),
+        Path("/mnt/CRSP_2024_ESGCombinedScore.xlsx"),
     ]
     ret_paths = [
         Path("CRSP_2024_returns_and_volatility.xlsx"),
-        Path("/mnt/data/CRSP_2024_returns_and_volatility.xlsx"),
+        Path("/mnt/CRSP_2024_returns_and_volatility.xlsx"),
     ]
 
     esg_path = next((p for p in esg_paths if p.exists()), None)
